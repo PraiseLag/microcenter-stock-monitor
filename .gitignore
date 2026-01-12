@@ -1,9 +1,12 @@
+# Secrets
 config.env
 .env
 *.env
 
-# Allow template env files to be committed
+# Allow template env files
 !config.example.env
+!config.env.example
+
 
 __pycache__/
 *.pyc
