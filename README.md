@@ -40,8 +40,11 @@ This project is designed to run continuously and automatically track inventory c
 ### 1. Clone the repository
 ```bash
 git clone https://github.com/PraiseLag/microcenter-stock-monitor.git
+```
+```bash
 cd microcenter-stock-monitor
 ```
+
 
 <i>Alternatively: If you download the ZIP from GitHub, extract it using 7zip or WinRAR.</i>
 
