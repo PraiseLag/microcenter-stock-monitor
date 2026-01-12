@@ -16,3 +16,7 @@ discord_live_list_state.json
 logs/
 *.log
 
+
+# Runtime state
+stock_state.json
+discord_instock_alerts.json
