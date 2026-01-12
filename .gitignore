@@ -2,6 +2,9 @@ config.env
 .env
 *.env
 
+# Allow template env files to be committed
+!config.example.env
+
 __pycache__/
 *.pyc
 
