@@ -13,6 +13,7 @@ from notifier import notify_all, notify_open_box
 from state import load_state, save_state
 from stock_checker import build_driver, check_stock
 from discord_status import DiscordStatusMessage
+from discord_live_list import DiscordLiveListMessage
 
 
 POLL_SECONDS = 120
@@ -30,6 +31,38 @@ def _env_on(name: str, default: bool = True) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def _mk_name_link(product: dict) -> str:
+    name = product.get("name", "Unknown")
+    url = (product.get("url", "") or "").strip()
+    if url:
+        return f"[{name}]({url})"
+    return str(name)
+
+
+def _fmt_new_stock_line(qty: int | None, in_stock: bool) -> str:
+    if not in_stock:
+        return "OUT OF STOCK"
+    if qty is None:
+        return "IN STOCK"
+    try:
+        q = int(qty)
+        return f"{q} NEW IN STOCK"
+    except Exception:
+        return "IN STOCK"
+
+
+def _fmt_open_box_line(ob_available: bool, ob_qty: int | None) -> str:
+    if not ob_available:
+        return "NO OPEN BOX"
+    if ob_qty is None:
+        return "OPEN BOX AVAILABLE"
+    try:
+        q = int(ob_qty)
+        return f"{q} OPEN BOX IN STOCK"
+    except Exception:
+        return "OPEN BOX AVAILABLE"
+
+
 def main() -> None:
     load_dotenv("config.env", override=True)
 
@@ -45,6 +78,14 @@ def main() -> None:
     if webhook_url and _env_on("ENABLE_DISCORD_ALERTS", True):
         status = DiscordStatusMessage(webhook_url, state_path=STATUS_STATE_PATH)
 
+    live_list = None
+    if webhook_url and _env_on("ENABLE_DISCORD_ALERTS", True):
+        try:
+            live_list = DiscordLiveListMessage(webhook_url, state_path="discord_live_list_state.json")
+        except Exception as e:
+            print(f"Discord live list init failed (non fatal): {e}")
+            live_list = None
+
     start_ts = time.time()
 
     product_count = len(PRODUCTS)
@@ -52,12 +93,14 @@ def main() -> None:
     checks_per_cycle = product_count * store_count
 
     open_box_tracking = _env_on("ENABLE_OPEN_BOX_TRACKING", True)
+    delete_alerts_on_sellout = _env_on("DELETE_DISCORD_ALERTS_ON_SELLOUT", False)
 
     while True:
         cycle_start = now_local_str(tz)
         print(f"\n=== Stock check cycle @ {cycle_start} ===")
 
         last_error = None
+        prev_state = dict(state)
 
         new_stock_now_by_key = {}
         new_qty_by_key = {}
@@ -76,7 +119,7 @@ def main() -> None:
 
                     try:
                         new_in_stock_now, new_qty_now, ob_available_now, ob_qty_now = check_stock(
-                            driver, product, store_id
+                            driver, product, store_id, open_box_enabled=open_box_tracking
                         )
                     except Exception as e:
                         msg = f"{product.get('name', 'Unknown')} at {store_name}: {e}"
@@ -141,6 +184,19 @@ def main() -> None:
 
                 state[key] = new_now
 
+                if delete_alerts_on_sellout and _env_on("ENABLE_DISCORD_ALERTS", True):
+                    if new_before and (not new_now):
+                        try:
+                            from discord_alert_tracker import get_message_id, clear_message_id
+                            from discord_alert import delete_discord_message
+
+                            mid = get_message_id(sku=str(sku), store_id=str(store_id))
+                            if mid:
+                                delete_discord_message(str(mid))
+                                clear_message_id(sku=str(sku), store_id=str(store_id))
+                        except Exception as e:
+                            print(f"Sellout delete failed (non fatal): {e}")
+
                 if open_box_tracking and _env_on("ENABLE_OPEN_BOX_ALERTS", True):
                     ob_now = bool(open_box_now_by_key.get(ob_key, False))
                     ob_before = bool(state.get(ob_key, False))
@@ -151,8 +207,22 @@ def main() -> None:
                         notify_open_box(product=product, store_name=store_name, store_id=store_id, open_box_qty=ob_qty)
 
                     state[ob_key] = ob_now
+
+                    if delete_alerts_on_sellout and _env_on("ENABLE_DISCORD_ALERTS", True):
+                        if ob_before and (not ob_now):
+                            try:
+                                from discord_alert_tracker import get_message_id, clear_message_id
+                                from discord_alert import delete_discord_message
+
+                                mid = get_message_id(sku=str("ob_" + str(sku)), store_id=str(store_id))
+                                if mid:
+                                    delete_discord_message(str(mid))
+                                    clear_message_id(sku=str("ob_" + str(sku)), store_id=str(store_id))
+                            except Exception as e:
+                                print(f"Open box sellout delete failed (non fatal): {e}")
                 else:
-                    state[ob_key] = False
+                    if ob_key in state:
+                        del state[ob_key]
 
         save_state(state)
 
@@ -172,6 +242,49 @@ def main() -> None:
                 )
             except Exception as e:
                 print(f"Discord status update failed (non fatal): {e}")
+
+        if webhook_url and _env_on("ENABLE_DISCORD_ALERTS", True) and live_list:
+            try:
+                lines = []
+
+                for product in PRODUCTS:
+                    sku = str(product.get("sku", "")).strip()
+                    name_link = _mk_name_link(product)
+
+                    any_in_stock = False
+                    for store_name, store_id in STORES.items():
+                        key = f"{sku}_{store_id}"
+                        if bool(new_stock_now_by_key.get(key, False)):
+                            any_in_stock = True
+                            break
+
+                    status_square = "🟩" if any_in_stock else "🟥"
+                    lines.append(f"{status_square} {name_link}")
+
+                    for store_name, store_id in STORES.items():
+                        key = f"{sku}_{store_id}"
+                        ob_key = f"ob_{sku}_{store_id}"
+
+                        now_in = bool(new_stock_now_by_key.get(key, False))
+                        qty = new_qty_by_key.get(key)
+                        new_part = _fmt_new_stock_line(qty, now_in)
+
+                        if open_box_tracking:
+                            ob_now = bool(open_box_now_by_key.get(ob_key, False))
+                            ob_qty = open_box_qty_by_key.get(ob_key)
+                            ob_part = _fmt_open_box_line(ob_now, ob_qty)
+                            lines.append(f"• {store_name}: {new_part} | {ob_part}")
+                        else:
+                            lines.append(f"• {store_name}: {new_part}")
+
+                    lines.append("")
+
+                while lines and lines[-1] == "":
+                    lines.pop()
+
+                live_list.update(lines=lines, last_check_local=cycle_start)
+            except Exception as e:
+                print(f"Discord live list update failed (non fatal): {e}")
 
         print(f"Sleeping for {POLL_SECONDS} seconds...\n")
         time.sleep(POLL_SECONDS)

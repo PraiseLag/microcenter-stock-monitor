@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from discord_http import request_with_retry
+
 
 class DiscordStatusMessage:
     """
@@ -61,22 +63,22 @@ class DiscordStatusMessage:
 
         payload = {"content": "🟨 Stock bot STARTING\nInitializing status message..."}
         post_url = self._with_wait_true(self.webhook_url)
-        r = requests.post(post_url, json=payload, timeout=15)
+        r = request_with_retry("POST", post_url, json=payload, timeout=15)
 
-        if not (200 <= r.status_code < 300):
-            snippet = (r.text or "").strip()
+        if r is None or not (200 <= r.status_code < 300):
+            snippet = ((r.text if r is not None else "") or "").strip()
             snippet = snippet[:250] if snippet else "no response body"
-            raise RuntimeError(f"Discord webhook POST failed: HTTP {r.status_code}: {snippet}")
+            raise RuntimeError(f"Discord webhook POST failed: HTTP {(r.status_code if r is not None else 'no-status')}: {snippet}")
 
         try:
             data = r.json()
         except Exception:
-            snippet = (r.text or "").strip()
+            snippet = ((r.text if r is not None else "") or "").strip()
             snippet = snippet[:250] if snippet else "empty body"
             raise RuntimeError(
                 "Discord webhook did not return JSON. "
                 "This usually means wait=true was not applied correctly. "
-                f"HTTP {r.status_code}: {snippet}"
+                f"HTTP {(r.status_code if r is not None else 'no-status')}: {snippet}"
             )
 
         if "id" not in data:
@@ -88,23 +90,25 @@ class DiscordStatusMessage:
         self._save_state(state)
         return message_id
 
-    def _edit_message(self, message_id: str, content: str, allowed_mentions: dict | None = None) -> None:
+    def _edit_message(self, message_id: str, content: str, allowed_mentions: dict | None = None) -> bool:
         edit_url = f"{self.webhook_url}/messages/{message_id}"
         payload = {"content": content}
         if allowed_mentions is not None:
             payload["allowed_mentions"] = allowed_mentions
 
         try:
-            r = requests.patch(edit_url, json=payload, timeout=15)
+            r = request_with_retry("PATCH", edit_url, json=payload, timeout=15)
         except Exception as e:
             print(f"[discord_status] Discord webhook PATCH exception: {e}")
-            return
+            return False
 
-        if not (200 <= r.status_code < 300):
-            snippet = (r.text or "").strip()
+        if r is None or not (200 <= r.status_code < 300):
+            snippet = ((r.text if r is not None else "") or "").strip()
             snippet = snippet[:250] if snippet else "no response body"
-            print(f"[discord_status] Discord webhook PATCH failed: HTTP {r.status_code}: {snippet}")
-            return
+            print(f"[discord_status] Discord webhook PATCH failed: HTTP {(r.status_code if r is not None else 'no-status')}: {snippet}")
+            return False
+
+        return True
 
     def _fmt_local_time(self, tz_name: str | None) -> str:
         if tz_name:
@@ -174,7 +178,15 @@ class DiscordStatusMessage:
         content = "\n".join(lines)
 
         try:
-            self._edit_message(message_id, content, allowed_mentions={"parse": []})
+            ok = self._edit_message(message_id, content, allowed_mentions={"parse": []})
+            if not ok:
+                # Self heal: message may have been deleted; recreate and retry once
+                try:
+                    self.clear_saved_message_id()
+                    message_id = self.ensure_message()
+                    self._edit_message(str(message_id), content, allowed_mentions={"parse": []})
+                except Exception as e:
+                    print(f"[discord_status] Self-heal retry failed (non fatal): {e}")
         except Exception as e:
             print(f"[discord_status] Status update failed unexpectedly: {e}")
 
@@ -227,7 +239,14 @@ class DiscordStatusMessage:
         content = "\n".join(lines)
 
         try:
-            self._edit_message(str(message_id), content, allowed_mentions=allowed_mentions)
+            ok = self._edit_message(str(message_id), content, allowed_mentions=allowed_mentions)
+            if not ok:
+                try:
+                    self.clear_saved_message_id()
+                    message_id = self.ensure_message()
+                    self._edit_message(str(message_id), content, allowed_mentions=allowed_mentions)
+                except Exception as e:
+                    print(f"[discord_status] Self-heal retry failed (non fatal): {e}")
         except Exception as e:
             print(f"[discord_status] set_stopped failed unexpectedly: {e}")
 

@@ -114,7 +114,7 @@ def _extract_open_box_info(page_source: str) -> tuple[int | None, bool]:
     return None, True
 
 
-def check_stock(driver: webdriver.Chrome, product: dict, store_id: str) -> tuple[bool, int | None, bool, int | None]:
+def check_stock(driver: webdriver.Chrome, product: dict, store_id: str, open_box_enabled: bool = True) -> tuple[bool, int | None, bool, int | None]:
     """
     Returns:
       (new_in_stock_bool, new_qty_or_none, open_box_available_bool, open_box_qty_or_none)
@@ -140,6 +140,9 @@ def check_stock(driver: webdriver.Chrome, product: dict, store_id: str) -> tuple
     new_in_stock = any(marker in page_source for marker in in_stock_markers)
     new_qty = _extract_new_qty(page_source) if new_in_stock else None
 
-    open_box_qty, open_box_available = _extract_open_box_info(page_source)
+    if open_box_enabled:
+        open_box_qty, open_box_available = _extract_open_box_info(page_source)
+    else:
+        open_box_qty, open_box_available = None, False
 
     return bool(new_in_stock), new_qty, bool(open_box_available), open_box_qty

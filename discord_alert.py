@@ -2,12 +2,24 @@
 
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-import requests
+from discord_http import request_with_retry
+
+import discord_alert_tracker
 
 
 def _get_webhook() -> str:
-    return (os.getenv("DISCORD_WEBHOOK") or os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
+    # Prefer DISCORD_WEBHOOK_URL, fallback to DISCORD_WEBHOOK
+    return (os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK") or "").strip()
+
+
+def _with_wait_true(url: str) -> str:
+    parts = urlparse(url)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q["wait"] = "true"
+    new_query = urlencode(q)
+    return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment))
 
 
 def _format_new_qty(qty: int | None) -> str:
@@ -30,18 +42,55 @@ def _format_open_box(open_box_qty: int | None) -> str:
     return f"📦 Open box at this store: {q} OPEN BOX IN STOCK"
 
 
-def _post_embed(payload: dict) -> None:
+def _post_embed(payload: dict) -> str | None:
     webhook = _get_webhook()
     if not webhook:
-        print("DISCORD_WEBHOOK not set, skipping Discord alert")
-        return
+        print("DISCORD_WEBHOOK_URL not set, skipping Discord alert")
+        return None
+
+    post_url = _with_wait_true(webhook)
 
     try:
-        r = requests.post(webhook, json=payload, timeout=10)
-        r.raise_for_status()
+        r = request_with_retry("POST", post_url, json=payload, timeout=15)
+        if r is None:
+            print("❌ Discord alert failed: no response")
+            return None
+
+        if not (200 <= r.status_code < 300):
+            snippet = (r.text or "").strip()
+            snippet = snippet[:250] if snippet else "no response body"
+            print(f"❌ Discord alert failed: HTTP {r.status_code}: {snippet}")
+            return None
+
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+
+        msg_id = str(data.get("id")) if isinstance(data, dict) and data.get("id") else None
         print("🚀 Discord alert sent")
+        return msg_id
+
     except Exception as e:
         print(f"❌ Discord alert failed: {e}")
+        return None
+
+
+def delete_discord_message(message_id: str) -> bool:
+    webhook = _get_webhook()
+    if not webhook or not message_id:
+        return False
+
+    url = f"{webhook}/messages/{message_id}"
+    r = request_with_retry("DELETE", url, json=None, timeout=15)
+    if r is None:
+        return False
+
+    # Discord returns 204 on success for DELETE, 404 if already gone
+    if r.status_code in {204, 404}:
+        return True
+
+    return 200 <= r.status_code < 300
 
 
 def send_discord_alert(
@@ -103,7 +152,13 @@ def send_discord_alert(
     if avatar_url:
         payload["avatar_url"] = avatar_url
 
-    _post_embed(payload)
+    message_id = _post_embed(payload)
+
+    if message_id and store_id:
+        try:
+            discord_alert_tracker.set_message_id(sku=str(sku), store_id=str(store_id), message_id=str(message_id))
+        except Exception:
+            pass
 
 
 def send_open_box_alert(
@@ -165,4 +220,12 @@ def send_open_box_alert(
     if avatar_url:
         payload["avatar_url"] = avatar_url
 
-    _post_embed(payload)
+    message_id = _post_embed(payload)
+
+    if message_id and store_id:
+        try:
+            discord_alert_tracker.set_message_id(
+                sku=str("ob_" + str(sku)), store_id=str(store_id), message_id=str(message_id)
+            )
+        except Exception:
+            pass
