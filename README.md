@@ -107,11 +107,11 @@ sudo apt install google-chrome-stable
 
 ### config.env
 
-You must create a file named `config.env` in the project root directory.
+You must edit a file named `config.env` in the project root directory.
 
 This file controls all bot behavior and contains sensitive credentials. It is intentionally ignored by Git and should never be committed.
 
-A template file (`config.example.env`) is provided for reference.
+A template file (`config.env`) is provided for reference.
 
 ---
 
